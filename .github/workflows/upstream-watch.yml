@@ -1,0 +1,120 @@
+name: upstream-watch
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+      current_sha: ${{ steps.compare.outputs.current_sha }}
+      commits: ${{ steps.compare.outputs.commits }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare with upstream
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git ls-remote https://github.com/router-for-me/CLIProxyAPI.git refs/heads/main | awk '{print $1}')"
+          git fetch --no-tags --depth=100 https://github.com/router-for-me/CLIProxyAPI.git main:refs/remotes/upstream/main
+          commits="$(git log --no-merges --format='%h %s' "$current_sha..refs/remotes/upstream/main" | head -50 || true)"
+          {
+            echo "current_sha=$current_sha"
+            echo "upstream_sha=$upstream_sha"
+            echo "changed=$([ "$current_sha" = "$upstream_sha" ] && echo false || echo true)"
+            echo "commits<<EOF"
+            printf '%s\n' "$commits"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  validate:
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream candidate
+        uses: actions/checkout@v4
+        with:
+          repository: router-for-me/CLIProxyAPI
+          ref: ${{ needs.detect.outputs.upstream_sha }}
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run upstream tests
+        run: go test ./...
+
+      - name: Build upstream candidate image
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image without publishing
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --tag cli-proxy-api-upstream-check:${{ needs.detect.outputs.upstream_sha }} \
+            .
+
+      - name: Record candidate image digest
+        run: docker image inspect --format='Candidate image ID: {{.Id}}' cli-proxy-api-upstream-check:${{ needs.detect.outputs.upstream_sha }}
+
+  report:
+    needs: [detect, validate]
+    if: always() && needs.detect.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open one tracking issue for this upstream change
+        uses: actions/github-script@v7
+        env:
+          UPSTREAM_SHA: ${{ needs.detect.outputs.upstream_sha }}
+          CURRENT_SHA: ${{ needs.detect.outputs.current_sha }}
+          COMMITS: ${{ needs.detect.outputs.commits }}
+          VALIDATION_RESULT: ${{ needs.validate.result }}
+        with:
+          script: |
+            const sha = process.env.UPSTREAM_SHA;
+            const shortSha = sha.slice(0, 12);
+            const title = "[upstream] CLIProxyAPI update available (" + shortSha + ")";
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const openIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner, repo, state: "open", per_page: 100 }
+            );
+            if (openIssues.some(issue => issue.title.startsWith("[upstream] CLIProxyAPI update available"))) {
+              core.info("An upstream tracking issue is already open.");
+              return;
+            }
+            const body = [
+              "An upstream CLIProxyAPI change was detected.",
+              "",
+              "- Fork HEAD: " + process.env.CURRENT_SHA,
+              "- Upstream main: " + sha,
+              "- Candidate validation: " + process.env.VALIDATION_RESULT,
+              "",
+              "Commits since the fork HEAD:",
+              "~~~text",
+              process.env.COMMITS || "(no common commit range; inspect the upstream ref)",
+              "~~~",
+              "",
+              "Review the custom patch before rebuilding or deploying the production image."
+            ].join("\\n");
+            await github.rest.issues.create({ owner, repo, title, body });
